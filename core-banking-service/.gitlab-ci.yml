@@ -1,0 +1,387 @@
+stages:
+  - build
+  - test
+  - package
+  - deploy
+  - verify
+  - rollback
+
+variables:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  SERVICE_NAME: "core-banking-service"
+  REGISTRY: $CI_REGISTRY
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/$SERVICE_NAME
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+# Build stage
+build:
+  stage: build
+  image: gradle:8.4-jdk21-alpine
+  script:
+    - echo "Building $SERVICE_NAME..."
+    - gradle clean build -x test --no-daemon
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 1 day
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  only:
+    - branches
+
+# Test stage
+test:
+  stage: test
+  image: gradle:8.4-jdk21-alpine
+  script:
+    - echo "Running tests for $SERVICE_NAME..."
+    - gradle test --no-daemon
+  artifacts:
+    reports:
+      junit: build/test-results/test/*.xml
+    paths:
+      - build/test-results/test
+    expire_in: 30 days
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  only:
+    - branches
+
+# Code Quality (optional)
+code:quality:
+  stage: test
+  image: gradle:8.4-jdk21-alpine
+  script:
+    - echo "Running code quality checks..."
+    - gradle sonarqube -x test --no-daemon || true
+  only:
+    - merge_requests
+    - develop
+    - main
+  allow_failure: true
+
+# Package Docker image
+package:docker:
+  stage: package
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - echo "Logging in to Docker registry..."
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "Building Docker image for $SERVICE_NAME:$CI_COMMIT_SHA"
+    - docker build -t $IMAGE_NAME:$CI_COMMIT_SHA .
+    - docker tag $IMAGE_NAME:$CI_COMMIT_SHA $IMAGE_NAME:latest
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag $IMAGE_NAME:$CI_COMMIT_SHA $IMAGE_NAME:prod-$CI_COMMIT_SHORT_SHA
+      fi
+    - echo "Pushing Docker image to registry..."
+    - docker push $IMAGE_NAME:$CI_COMMIT_SHA
+    - docker push $IMAGE_NAME:latest
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker push $IMAGE_NAME:prod-$CI_COMMIT_SHORT_SHA
+      fi
+    - echo "✓ Docker image pushed successfully"
+  after_script:
+    - docker logout $CI_REGISTRY
+  only:
+    - main
+    - develop
+
+# Security scan (optional)
+security:scan:
+  stage: package
+  image: aquasec/trivy:latest
+  script:
+    - echo "Scanning Docker image for vulnerabilities..."
+    - trivy image --severity HIGH,CRITICAL --exit-code 0 $IMAGE_NAME:$CI_COMMIT_SHA
+  allow_failure: true
+  only:
+    - main
+    - develop
+
+# Deploy to staging
+deploy:staging:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - echo "🚀 Preparing staging deployment..."
+    - apk add --no-cache openssh-client bash curl
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $STAGING_SERVER >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    - echo "📦 Deploying $SERVICE_NAME to staging..."
+    - echo "Image: $IMAGE_NAME:$CI_COMMIT_SHA"
+    - |
+      ssh $DEPLOY_USER@$STAGING_SERVER << 'EOF'
+      set -e
+      cd /opt/deployment
+      
+      echo "Pulling latest images..."
+      export IMAGE_TAG=$CI_COMMIT_SHA
+      export REGISTRY=$CI_REGISTRY
+      export PROJECT=$CI_PROJECT_PATH
+      docker-compose pull --no-parallel
+      
+      echo "Starting staging deployment..."
+      docker-compose up -d
+      
+      echo "Waiting for services to start..."
+      sleep 15
+      
+      echo "Checking service health..."
+      docker-compose exec -T core-banking-service curl -f http://localhost:8092/actuator/health || exit 1
+      
+      echo "✓ Staging deployment successful"
+      EOF
+  environment:
+    name: staging
+    url: https://staging-api.example.com
+  only:
+    - develop
+  when: on_success
+
+# Deploy to production
+deploy:production:docker-compose:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - echo "⚠️  PRODUCTION DEPLOYMENT INITIATED"
+    - echo "Service: $SERVICE_NAME"
+    - echo "Image: $IMAGE_NAME:$CI_COMMIT_SHA"
+    - echo "Commit: $CI_COMMIT_SHORT_SHA"
+    - echo "Author: $CI_COMMIT_AUTHOR"
+    - echo "---"
+    - apk add --no-cache openssh-client bash curl
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $PROD_SERVER >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    # Pre-deployment checks
+    - |
+      echo "📋 Running pre-deployment checks..."
+      ssh $PROD_DEPLOY_USER@$PROD_SERVER << 'CHECKS'
+      set -e
+      cd /opt/deployment
+      
+      echo "Current running services:"
+      docker-compose ps || true
+      
+      echo ""
+      echo "Creating database backup..."
+      mkdir -p backups
+      docker-compose exec -T mysql mysqldump -uroot -p$DB_ROOT_PASSWORD $DB_NAME 2>/dev/null | gzip > backups/backup-$(date +%Y%m%d-%H%M%S).sql.gz || true
+      echo "✓ Database backed up"
+      CHECKS
+    
+    # Perform deployment
+    - |
+      echo "🚀 Starting production deployment..."
+      ssh $PROD_DEPLOY_USER@$PROD_SERVER << 'DEPLOY'
+      set -e
+      cd /opt/deployment
+      
+      export IMAGE_TAG=$CI_COMMIT_SHA
+      export REGISTRY=$CI_REGISTRY
+      export PROJECT=$CI_PROJECT_PATH
+      
+      echo "Pulling new images..."
+      docker-compose pull --no-parallel || {
+        echo "❌ Failed to pull images"
+        exit 1
+      }
+      
+      echo "Stopping old containers gracefully..."
+      docker-compose down --remove-orphans || true
+      
+      echo "Starting new containers..."
+      docker-compose up -d
+      
+      echo "Waiting for services to initialize..."
+      sleep 20
+      DEPLOY
+    
+    # Health verification
+    - |
+      echo "🔍 Running health checks..."
+      ssh $PROD_DEPLOY_USER@$PROD_SERVER << 'HEALTH'
+      set -e
+      cd /opt/deployment
+      
+      check_service() {
+        local service=$1
+        local port=$2
+        local retries=30
+        local count=0
+        
+        echo -n "  Checking $service... "
+        while [ $count -lt $retries ]; do
+          if docker-compose exec -T $service curl -sf http://localhost:$port/actuator/health > /dev/null 2>&1; then
+            echo "✓"
+            return 0
+          fi
+          count=$((count+1))
+          sleep 2
+        done
+        
+        echo "✗ FAILED"
+        return 1
+      }
+      
+      # Check critical services
+      check_service "core-banking-service" 8092 || exit 1
+      check_service "user-service" 8091 || exit 1
+      check_service "api-gateway" 8080 || exit 1
+      check_service "service-registry" 8761 || exit 1
+      
+      echo ""
+      echo "Container status:"
+      docker-compose ps
+      
+      echo ""
+      echo "✓ All services are healthy"
+      HEALTH
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        echo "❌ Deployment failed - initiating automatic rollback..."
+        ssh $PROD_DEPLOY_USER@$PROD_SERVER << 'ROLLBACK' || true
+        cd /opt/deployment
+        echo "Rolling back to previous version..."
+        docker-compose down --remove-orphans || true
+        export IMAGE_TAG=latest
+        docker-compose pull || true
+        docker-compose up -d || true
+        sleep 10
+        docker-compose ps || true
+        ROLLBACK
+      fi
+  environment:
+    name: production
+    url: https://api.example.com
+    deployment_tier: production
+  when: manual
+  only:
+    - main
+
+# Verify production deployment
+verify:production:
+  stage: verify
+  image: curlimages/curl:latest
+  environment:
+    name: production
+    url: https://api.example.com
+  script:
+    - echo "Verifying production deployment..."
+    - sleep 15
+    - |
+      for i in {1..10}; do
+        echo "Health check attempt $i/10..."
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+          https://api.example.com/actuator/health)
+        
+        if [ "$RESPONSE" = "200" ]; then
+          echo "✓ Service is healthy (HTTP $RESPONSE)"
+          exit 0
+        fi
+        
+        echo "Service returned HTTP $RESPONSE, retrying..."
+        sleep 10
+      done
+      
+      echo "❌ Service health check failed"
+      exit 1
+  retry:
+    max: 2
+    when: script_failure
+  only:
+    - main
+  when: on_success
+
+# Collect metrics
+metrics:production:
+  stage: verify
+  image: curlimages/curl:latest
+  script:
+    - echo "Collecting deployment metrics..."
+    - |
+      curl -s https://api.example.com/actuator/metrics | head -50 || true
+  only:
+    - main
+  when: on_success
+  allow_failure: true
+
+# Manual rollback
+rollback:production:
+  stage: rollback
+  image: alpine:latest
+  before_script:
+    - echo "⚠️  INITIATING PRODUCTION ROLLBACK"
+    - apk add --no-cache openssh-client bash
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $PROD_SERVER >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    - |
+      ssh $PROD_DEPLOY_USER@$PROD_SERVER << 'ROLLBACK'
+      set -e
+      cd /opt/deployment
+      
+      echo "Current containers:"
+      docker-compose ps || true
+      
+      echo ""
+      echo "Rolling back to latest production image..."
+      docker-compose down --remove-orphans || true
+      
+      export IMAGE_TAG=latest
+      export REGISTRY=$CI_REGISTRY
+      export PROJECT=$CI_PROJECT_PATH
+      docker-compose pull --no-parallel || true
+      docker-compose up -d
+      
+      echo "Waiting for services..."
+      sleep 15
+      
+      echo "Verifying rollback..."
+      docker-compose exec -T core-banking-service curl -f http://localhost:8092/actuator/health || exit 1
+      
+      echo ""
+      docker-compose ps
+      echo "✓ Rollback completed"
+      ROLLBACK
+  environment:
+    name: production
+    action: rollback
+  when: manual
+  only:
+    - main
+
+# Success notification
+success:notification:
+  stage: .post
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        echo "✓ Pipeline completed successfully"
+      fi
+  when: on_success
+  only:
+    - main
+  allow_failure: true
