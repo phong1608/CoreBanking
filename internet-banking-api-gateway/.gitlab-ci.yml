@@ -1,0 +1,101 @@
+stages:
+  - build
+  - test
+  - package
+  - deploy
+
+variables:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  SERVICE_NAME: "internet-banking-api-gateway"
+  REGISTRY: $CI_REGISTRY
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/$SERVICE_NAME
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+# Build stage
+build:
+  stage: build
+  image: gradle:8.4-jdk21-alpine
+  script:
+    - echo "Building $SERVICE_NAME..."
+    - gradle clean build -x test --no-daemon
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 1 day
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  only:
+    - branches
+
+# Test stage
+test:
+  stage: test
+  image: gradle:8.4-jdk21-alpine
+  script:
+    - echo "Running tests for $SERVICE_NAME..."
+    - gradle test --no-daemon
+  artifacts:
+    reports:
+      junit: build/test-results/test/*.xml
+    paths:
+      - build/test-results/test
+    expire_in: 30 days
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  only:
+    - branches
+
+# Package Docker image
+package:docker:
+  stage: package
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Building Docker image for $SERVICE_NAME..."
+    - docker build -t $IMAGE_NAME:$CI_COMMIT_SHA .
+    - docker tag $IMAGE_NAME:$CI_COMMIT_SHA $IMAGE_NAME:latest
+    - echo "Pushing Docker image..."
+    - docker push $IMAGE_NAME:$CI_COMMIT_SHA
+    - docker push $IMAGE_NAME:latest
+  only:
+    - main
+    - develop
+
+# Deploy to staging
+deploy:staging:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Deploying $SERVICE_NAME to staging environment..."
+    - echo "Docker image: $IMAGE_NAME:$CI_COMMIT_SHA"
+  environment:
+    name: staging
+    url: https://staging-gateway.example.com
+  only:
+    - develop
+
+# Deploy to production
+deploy:production:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Deploying $SERVICE_NAME to production environment..."
+    - echo "Docker image: $IMAGE_NAME:$CI_COMMIT_SHA"
+  environment:
+    name: production
+    url: https://gateway.example.com
+  when: manual
+  only:
+    - main
